@@ -1,0 +1,8 @@
+# Auto-generated
+__pycache__/
+*.pyc
+*.pyo
+
+# ISA output (large, regenerate on server)
+isa_prelim/
+*.csv
