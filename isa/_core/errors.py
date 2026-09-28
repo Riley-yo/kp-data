@@ -1,0 +1,2 @@
+class Unsupported(ValueError):
+    pass
