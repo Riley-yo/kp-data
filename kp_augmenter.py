@@ -304,29 +304,140 @@ def run_kp_augmentation(
         for p in parents
     }
 
+    # 预采样原始参数分布，用于 random_generate
+    orig_n_vals = [len(p["parameters"]["weights"]) for p in parents]
+    orig_caps = [p["parameters"]["capacity"] for p in parents]
+
     rng = np.random.default_rng(seed)
     accepted_count = 0
 
-    for round_idx in range(1, max_rounds + 1):
-        # 拟合投影 + 算形状
-        transformer = PrelimTransformer.fit(all_features, feature_names=list(all_features.columns))
-        transformed = transformer.transform_frame(all_features)
-        stable = [i for i in range(transformed.shape[1]) if np.isfinite(transformed[:, i]).all() and float(np.std(transformed[:, i])) > 1e-10]
-        stable_names = [list(all_features.columns)[i] for i in stable]
-        stable_values = transformed[:, stable]
+    # === 第一阶段：批量生成 + 始终接受 ===
+    # 师兄确认：扩大随机生成范围，大量生成候选填充特征空间
+    # 不用形状门槛拒绝（SAGE 原始实例有极端离群点，形状门槛会一直拒绝）
+    # 目标：直接生成目标数量的候选，覆盖特征空间
+    target_synthetic = max_rounds * candidates_per_round  # 如 100轮×200=20000
 
-        selected_positions = []
-        for index, name in enumerate(stable_names):
-            if not any(abs(float(np.corrcoef(stable_values[:, index], stable_values[:, kept])[0, 1])) > 0.95 for kept in selected_positions):
-                selected_positions.append(index)
-        selected_names = [stable_names[i] for i in selected_positions]
-        selected_values = stable_values[:, selected_positions]
-        if len(selected_names) < 2:
-            print(f"Round {round_idx}: 特征不足，跳过")
+    print(f"\n第一阶段: 批量生成 {target_synthetic} 个候选（始终接受）")
+    batch_candidates = []
+    batch_features = []
+    attempts = 0
+    while len(batch_candidates) < target_synthetic and attempts < target_synthetic * 5:
+        attempts += 1
+        candidate_seed = int(seed + 1_000_003 * attempts)
+        local_rng = np.random.default_rng(candidate_seed)
+
+        # 80% 随机生成，20% 从父本变异
+        if local_rng.random() < 0.8:
+            operator = "random_generate"
+            # 从原始参数分布采样
+            n_new = int(local_rng.choice(orig_n_vals))
+            cap_new = int(local_rng.choice(orig_caps))
+            dist_type = local_rng.choice(["uniform", "small_heavy", "large_heavy", "mixed", "bimodal"])
+            if dist_type == "uniform":
+                new_w = [int(local_rng.integers(1, max(cap_new, 2))) for _ in range(n_new)]
+            elif dist_type == "small_heavy":
+                new_w = [int(local_rng.integers(1, max(cap_new // 5, 2))) for _ in range(n_new)]
+            elif dist_type == "large_heavy":
+                new_w = [int(local_rng.integers(max(cap_new // 2, 2), cap_new + 1)) for _ in range(n_new)]
+            elif dist_type == "mixed":
+                half = n_new // 2
+                new_w = [int(local_rng.integers(1, max(cap_new // 4, 2))) for _ in range(half)]
+                new_w += [int(local_rng.integers(max(cap_new // 2, 2), cap_new + 1)) for _ in range(n_new - half)]
+            else:
+                new_w = [int(local_rng.choice([
+                    int(local_rng.integers(1, max(cap_new // 5, 2))),
+                    int(local_rng.integers(max(cap_new // 2, 2), cap_new + 1))
+                ])) for _ in range(n_new)]
+            new_w = [max(1, w) for w in new_w]
+
+            # Pisinger 5 种利润-重量相关性类
+            corr_type = local_rng.choice([
+                "uncorrelated", "uncorrelated",
+                "weakly_correlated", "weakly_correlated",
+                "strongly_correlated",
+                "subset_sum",
+                "inverse_correlated",
+            ])
+            new_p = _generate_profits(new_w, cap_new, corr_type, local_rng)
+
+            result = {"weights": new_w, "profit": new_p, "capacity": cap_new}
+            params_meta = {"generated": True, "n": n_new, "cap": cap_new, "dist": dist_type, "corr": corr_type}
+        else:
+            operator = KP_OPERATORS[int(local_rng.integers(len(KP_OPERATORS)))]
+            parent_params = parents[int(local_rng.integers(len(parents)))]["parameters"]
+            result, params_meta = mutate_kp(parent_params, operator, local_rng)
+            if result is None:
+                continue
+
+        weights = result["weights"]
+        profits = result["profit"]
+        capacity = result["capacity"]
+        if not (2 <= len(weights) <= 200):
+            continue
+        if not all(w > 0 for w in weights):
+            continue
+        if not all(p >= 0 for p in profits):
+            continue
+        if capacity <= 0:
             continue
 
+        exact_h = kp_hash(weights, profits, capacity)
+        prop_h = kp_hash(weights, profits, capacity, proportional=True)
+        if exact_h in seen_exact or prop_h in seen_prop:
+            continue
+
+        seen_exact.add(exact_h)
+        seen_prop.add(prop_h)
+
+        try:
+            feat = extract_kp_features(result, kp_core_path)
+            if not all(np.isfinite(list(feat.values()))):
+                continue
+        except Exception:
+            continue
+
+        inst_id = f"synthetic_KP_{accepted_count + 1:06d}_{exact_h[:10]}"
+        batch_candidates.append({
+            "instance_id": inst_id,
+            "origin": "synthetic",
+            "variant": "domain",
+            "parameters": result,
+            "lineage": {
+                "parent_instance_id": "random" if operator == "random_generate" else "parent",
+                "operator": operator,
+                "operator_parameters": params_meta,
+                "round": 0,
+                "seed": candidate_seed,
+            },
+        })
+        batch_features.append({"instance_id": inst_id, **feat})
+        accepted_count += 1
+
+        if accepted_count % 5000 == 0:
+            print(f"  已生成 {accepted_count} 个候选...")
+
+    # 合并原始 + 批量候选
+    all_instances.extend(batch_candidates)
+    all_features = pd.concat([all_features, pd.DataFrame(batch_features).set_index("instance_id")])
+    print(f"第一阶段完成: {len(all_instances)} 个实例 ({len(parents)} SAGE + {accepted_count} synthetic)")
+
+    # === 第二阶段：最终投影 + 保存 ===
+    # 拟合投影 + 算形状
+    transformer = PrelimTransformer.fit(all_features, feature_names=list(all_features.columns))
+    transformed = transformer.transform_frame(all_features)
+    stable = [i for i in range(transformed.shape[1]) if np.isfinite(transformed[:, i]).all() and float(np.std(transformed[:, i])) > 1e-10]
+    stable_names = [list(all_features.columns)[i] for i in stable]
+    stable_values = transformed[:, stable]
+
+    selected_positions = []
+    for index, name in enumerate(stable_names):
+        if not any(abs(float(np.corrcoef(stable_values[:, index], stable_values[:, kept])[0, 1])) > 0.95 for kept in selected_positions):
+            selected_positions.append(index)
+    selected_names = [stable_names[i] for i in selected_positions]
+    selected_values = stable_values[:, selected_positions]
+    if len(selected_names) >= 2:
         selected_df = pd.DataFrame(selected_values, index=all_features.index, columns=selected_names)
-        fitted = pilot(selected_df, pd.DataFrame(index=selected_df.index), n_restarts=3, seed=seed)
+        fitted = pilot(selected_df, pd.DataFrame(index=selected_df.index), n_restarts=5, seed=seed)
         coords = fitted.coords
         metrics = shape_metrics(coords)
 
@@ -335,123 +446,8 @@ def run_kp_augmentation(
         disk = metrics["fitted_disk_inside_ratio"]
         sect = metrics["sector_cv_above_theoretical_minimum"]
 
-        print(f"Round {round_idx}: cov={cov:.3f}(≤{target_cov_ratio}), rad={rad:.3f}(≤{target_radial}), disk={disk:.3f}(≥{target_disk}), sect={sect:.3f}(≤{target_sector}), n={len(all_instances)}")
-
-        # 达标就停
-        if metrics["target_met"]:
-            print(f"Round {round_idx}: target_met=True, 停止增广")
-            break
-
-        # 生成候选
-        candidates = []
-        attempts = 0
-        while len(candidates) < candidates_per_round and attempts < candidates_per_round * 20:
-            candidate_seed = int(seed + 1_000_003 * round_idx + 104_729 * attempts)
-            local_rng = np.random.default_rng(candidate_seed)
-            operator = KP_OPERATORS[attempts % len(KP_OPERATORS)]
-
-            # 师兄确认：扩大随机生成范围，80% 概率完全随机生成，20% 从父本变异
-            if operator == "random_generate" or local_rng.random() < 0.8:
-                parent_params = {"weights": [1], "profit": [1], "capacity": 100}  # dummy for random_generate
-                operator = "random_generate"
-            else:
-                parent_params = parents[int(local_rng.integers(len(parents)))]["parameters"]
-
-            result, params = mutate_kp(parent_params, operator, local_rng)
-            attempts += 1
-            if result is None:
-                continue
-            weights = result["weights"]
-            profits = result["profit"]
-            capacity = result["capacity"]
-            if not (2 <= len(weights) <= 200):
-                continue
-            if not all(w > 0 for w in weights):
-                continue
-            if not all(p >= 0 for p in profits):
-                continue
-            if capacity <= 0:
-                continue
-
-            exact_h = kp_hash(weights, profits, capacity)
-            prop_h = kp_hash(weights, profits, capacity, proportional=True)
-            if exact_h in seen_exact or prop_h in seen_prop:
-                continue
-
-            seen_exact.add(exact_h)
-            seen_prop.add(prop_h)
-
-            inst_id = f"synthetic_KP_{accepted_count + len(candidates) + 1:06d}_{exact_h[:10]}"
-            candidates.append({
-                "instance_id": inst_id,
-                "origin": "synthetic",
-                "variant": "domain",
-                "parameters": {"weights": weights, "profit": profits, "capacity": capacity},
-                "lineage": {
-                    "parent_instance_id": parents[int(local_rng.integers(len(parents)))]["instance_id"] if operator != "random_generate" else "random",
-                    "operator": operator,
-                    "operator_parameters": params,
-                    "round": round_idx,
-                    "seed": candidate_seed,
-                },
-            })
-
-        if not candidates:
-            print(f"Round {round_idx}: 无候选，跳过")
-            continue
-
-        # 提取候选特征
-        cand_rows = []
-        valid_candidates = []
-        for c in candidates:
-            try:
-                feat = extract_kp_features(c["parameters"], kp_core_path)
-                if not all(np.isfinite(list(feat.values()))):
-                    continue
-                cand_rows.append({"instance_id": c["instance_id"], **feat})
-                valid_candidates.append(c)
-            except Exception:
-                continue
-
-        if not cand_rows:
-            print(f"Round {round_idx}: 候选特征提取失败，跳过")
-            continue
-
-        cand_df = pd.DataFrame(cand_rows).set_index("instance_id")
-
-        # 评估：加全部候选后圆度是否改善
-        combined_features = pd.concat([all_features, cand_df])
-        transformer2 = PrelimTransformer.fit(combined_features, feature_names=list(combined_features.columns))
-        transformed2 = transformer2.transform_frame(combined_features)
-        stable2 = [i for i in range(transformed2.shape[1]) if np.isfinite(transformed2[:, i]).all() and float(np.std(transformed2[:, i])) > 1e-10]
-        stable_names2 = [list(combined_features.columns)[i] for i in stable2]
-        stable_values2 = transformed2[:, stable2]
-        selected_positions2 = []
-        for index, name in enumerate(stable_names2):
-            if not any(abs(float(np.corrcoef(stable_values2[:, index], stable_values2[:, kept])[0, 1])) > 0.95 for kept in selected_positions2):
-                selected_positions2.append(index)
-        selected_names2 = [stable_names2[i] for i in selected_positions2]
-        selected_values2 = stable_values2[:, selected_positions2]
-        if len(selected_names2) < 2:
-            continue
-        selected_df2 = pd.DataFrame(selected_values2, index=combined_features.index, columns=selected_names2)
-        fitted2 = pilot(selected_df2, pd.DataFrame(index=selected_df2.index), n_restarts=3, seed=seed)
-        coords2 = fitted2.coords
-        metrics2 = shape_metrics(coords2)
-
-        # 接受规则：放宽——deficit 改善 OR cov 不显著恶化(恶化<0.3)且 rad 改善
-        total_deficit_before = max(cov - target_cov_ratio, 0) / target_cov_ratio + max(rad - target_radial, 0) / target_radial + max(target_disk - disk, 0) / target_disk + max(sect - target_sector, 0) / target_sector
-        total_deficit_after = max(metrics2["covariance_ratio"] - target_cov_ratio, 0) / target_cov_ratio + max(metrics2["radial_uniform_max_deviation"] - target_radial, 0) / target_radial + max(target_disk - metrics2["fitted_disk_inside_ratio"], 0) / target_disk + max(metrics2["sector_cv_above_theoretical_minimum"] - target_sector, 0) / target_sector
-        cov_worse = metrics2["covariance_ratio"] - cov
-        rad_better = metrics2["radial_uniform_max_deviation"] < rad
-
-        if total_deficit_after < total_deficit_before or (cov_worse < 0.3 and rad_better):
-            all_instances.extend(valid_candidates)
-            all_features = combined_features
-            accepted_count += len(valid_candidates)
-            print(f"Round {round_idx}: 接受 {len(valid_candidates)} 个候选，总实例 {len(all_instances)}，cov={metrics2['covariance_ratio']:.3f}, rad={metrics2['radial_uniform_max_deviation']:.3f}, disk={metrics2['fitted_disk_inside_ratio']:.3f}, sect={metrics2['sector_cv_above_theoretical_minimum']:.3f}")
-        else:
-            print(f"Round {round_idx}: 拒绝（cov_worse={cov_worse:.3f}, rad_better={rad_better}）")
+        print(f"最终: cov={cov:.3f}(≤{target_cov_ratio}), rad={rad:.3f}(≤{target_radial}), disk={disk:.3f}(≥{target_disk}), sect={sect:.3f}(≤{target_sector}), n={len(all_instances)}")
+        print(f"target_met: {metrics['target_met']}")
 
     # 保存结果
     output_jsonl = output_dir / "kp_augmented_instances.jsonl"
@@ -460,24 +456,8 @@ def run_kp_augmentation(
             f.write(json.dumps(inst, ensure_ascii=False) + "\n")
     print(f"\n保存 {len(all_instances)} 个实例到 {output_jsonl}")
 
-    # 保存最终坐标 + 图
-    transformer_final = PrelimTransformer.fit(all_features, feature_names=list(all_features.columns))
-    transformed_final = transformer_final.transform_frame(all_features)
-    stable_final = [i for i in range(transformed_final.shape[1]) if np.isfinite(transformed_final[:, i]).all() and float(np.std(transformed_final[:, i])) > 1e-10]
-    stable_names_final = [list(all_features.columns)[i] for i in stable_final]
-    stable_values_final = transformed_final[:, stable_final]
-    selected_positions_final = []
-    for index, name in enumerate(stable_names_final):
-        if not any(abs(float(np.corrcoef(stable_values_final[:, index], stable_values_final[:, kept])[0, 1])) > 0.95 for kept in selected_positions_final):
-            selected_positions_final.append(index)
-    selected_names_final = [stable_names_final[i] for i in selected_positions_final]
-    selected_values_final = stable_values_final[:, selected_positions_final]
-    selected_df_final = pd.DataFrame(selected_values_final, index=all_features.index, columns=selected_names_final)
-    fitted_final = pilot(selected_df_final, pd.DataFrame(index=selected_df_final.index), n_restarts=5, seed=seed)
-    coords_final = fitted_final.coords
-    metrics_final = shape_metrics(coords_final)
-
-    pd.DataFrame({"z1": coords_final[:, 0], "z2": coords_final[:, 1]}, index=all_features.index).to_csv(output_dir / "coordinates.csv")
+    # 保存最终坐标 + 图（使用第二阶段已拟合的 coords）
+    pd.DataFrame({"z1": coords[:, 0], "z2": coords[:, 1]}, index=all_features.index).to_csv(output_dir / "coordinates.csv")
 
     import matplotlib
     matplotlib.use("Agg")
@@ -492,21 +472,21 @@ def run_kp_augmentation(
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     if any(sage_mask):
-        axes[0].scatter(coords_final[sage_mask, 0], coords_final[sage_mask, 1], s=3, color="#0072B2", label=f"SAGE (n={sum(sage_mask)})")
+        axes[0].scatter(coords[sage_mask, 0], coords[sage_mask, 1], s=3, color="#0072B2", label=f"SAGE (n={sum(sage_mask)})")
     if any(synth_mask):
-        axes[0].scatter(coords_final[synth_mask, 0], coords_final[synth_mask, 1], s=3, color="#E69F00", marker="^", label=f"Synthetic (n={sum(synth_mask)})")
+        axes[0].scatter(coords[synth_mask, 0], coords[synth_mask, 1], s=3, color="#E69F00", marker="^", label=f"Synthetic (n={sum(synth_mask)})")
     axes[0].plot(r * np.cos(theta), r * np.sin(theta), "r--", alpha=0.3)
     axes[0].set_aspect("equal")
     axes[0].set_title(f"KP ISA after augmentation ({len(all_instances)} instances)")
     axes[0].legend()
-    axes[1].hist2d(coords_final[:, 0], coords_final[:, 1], bins=30, cmap="Blues")
+    axes[1].hist2d(coords[:, 0], coords[:, 1], bins=30, cmap="Blues")
     axes[1].set_aspect("equal")
     axes[1].set_title("Density heatmap")
     plt.tight_layout()
     plt.savefig(output_dir / "kp_projection_augmented.png", dpi=150)
 
-    print(f"最终: cov={metrics_final['covariance_ratio']:.3f}, rad={metrics_final['radial_uniform_max_deviation']:.3f}, disk={metrics_final['fitted_disk_inside_ratio']:.3f}, sect={metrics_final['sector_cv_above_theoretical_minimum']:.3f}")
-    print(f"target_met: {metrics_final['target_met']}")
+    print(f"\n最终: cov={metrics['covariance_ratio']:.3f}, rad={metrics['radial_uniform_max_deviation']:.3f}, disk={metrics['fitted_disk_inside_ratio']:.3f}, sect={metrics['sector_cv_above_theoretical_minimum']:.3f}")
+    print(f"target_met: {metrics['target_met']}")
     print(f"图已保存到 {output_dir}/kp_projection_augmented.png")
 
 
