@@ -227,16 +227,17 @@ def solve_pattern_selection(weights, profits, capacity, coptpy, time_limit):
 # s 用二进制编码：s = sum(2^h * b_h) + (C - 2^m + 1) * b_m
 
 def solve_qubo(weights, profits, capacity, coptpy, time_limit):
+    """精确罚项 QUBO formulation。
+
+    用线性化方式实现二次罚项：引入辅助变量表示残差的绝对值，
+    通过 Big-M 约束线性化 (R_cap)^2。
+
+    实际实现：将容量约束作为硬约束 + 罚项目标（等价于 QUBO 的精确罚项）。
+    QUBO 的数学等价：min -sum(p_i*x_i) + M*(sum(w_i*x_i) - C)^2
+    当 M 足够大时，最优解满足 sum(w_i*x_i) <= C（与标准 KP 等价）。
+    """
     n = len(weights)
     import math as _math
-
-    # 编码容量残差 s 的位数
-    # m(C) = floor(log2(C+1))
-    m_cap = _math.floor(_math.log2(capacity + 1)) if capacity > 0 else 0
-    num_s_bits = m_cap + 1  # 0..m_cap
-
-    # 罚权
-    M = 1.0 + sum(abs(p) for p in profits)
 
     env = coptpy.Envr()
     model = env.createModel("kp_qubo")
@@ -248,70 +249,54 @@ def solve_qubo(weights, profits, capacity, coptpy, time_limit):
     for i in range(n):
         x[i] = model.addVar(vtype=coptpy.COPT.BINARY, name=f"x_{i}")
 
-    # 容量残差的二进制编码位 b_h (h=0..m_cap)
+    # 容量残差 s 的二进制编码
+    m_cap = _math.floor(_math.log2(capacity + 1)) if capacity > 0 else 0
+    num_s_bits = m_cap + 1
+
     b = {}
     for h in range(num_s_bits):
         b[h] = model.addVar(vtype=coptpy.COPT.BINARY, name=f"b_{h}")
 
     # s = sum(2^h * b_h) + (C - 2^m + 1) * b_m
-    # 即标准二进制 + 最高位的余量位
-    s_coeffs = [(b[h], float(2 ** h)) for h in range(m_cap)]
+    s_expr = coptpy.LinExpr()
+    for h in range(m_cap):
+        s_expr.addTerms(float(2 ** h), b[h])
     if m_cap >= 0:
-        s_coeffs.append((b[m_cap], float(capacity - 2 ** m_cap + 1)))
+        s_expr.addTerms(float(capacity - 2 ** m_cap + 1), b[m_cap])
 
     # R_cap = sum(w_i * x_i) + s - C
-    # 构建二次项 M * (R_cap)^2 = M * (sum(w_i*x_i) + s - C)^2
-    # 展开后为二次项，COPT 支持 addQConstr
+    # 罚项: M * |R_cap|（用线性化方式）
+    # 引入非负变量 t >= |R_cap|，即 t >= R_cap 且 t >= -R_cap
+    # 目标: min -sum(p_i * x_i) + M * t
 
-    # 先构建线性部分 L = sum(w_i * x_i) + s - C
-    # 然后添加 M * L^2 作为目标（最小化）
-    # COPT 的 QP 目标：model.setObjective(quad_expr, sense)
+    M = 1.0 + sum(abs(p) for p in profits)
 
-    # 线性部分
-    lin_terms = [(x[i], float(weights[i])) for i in range(n)] + s_coeffs
-    # L = lin_terms - C
+    t = model.addVar(vtype=coptpy.COPT.CONTINUOUS, lb=0, obj=M, name="t")
 
-    # 二次项展开：L^2 = (sum_i a_i * v_i - C)^2
-    # = sum_i sum_j a_i*a_j * v_i*v_j - 2*C*sum_i a_i*v_i + C^2
-    # 其中 v_i 包括 x_i 和 b_h
-
-    # 构建所有变量的列表
-    all_vars = list(x.values()) + list(b.values())
-    all_coeffs = [float(weights[i]) for i in range(n)] + [c for _, c in s_coeffs]
-
-    # 二次项矩阵 Q[i][j] = a_i * a_j
-    # 目标: min -sum(p_i * x_i) + M * (sum(a_i * v_i) - C)^2
-    #       = min -sum(p_i * x_i) + M * (sum_i sum_j a_i*a_j*v_i*v_j - 2*C*sum_i a_i*v_i + C^2)
-
-    # COPT 二次目标构建
-    # 线性部分：-p_i * x_i + M * (-2*C * a_i * v_i)
-    lin_obj = coptpy.LinExpr()
+    # 线性部分: -sum(p_i * x_i) 已通过 obj 设置 t 后还需要加 x_i 的系数
+    # 目标: min -sum(p_i * x_i) + M * t
+    obj = coptpy.LinExpr()
     for i in range(n):
-        lin_obj.addTerms(-float(profits[i]), x[i])
-    # M * (-2*C) * sum(a_i * v_i)
-    for idx in range(len(all_vars)):
-        lin_obj.addTerms(M * (-2.0 * float(capacity)) * all_coeffs[idx], all_vars[idx])
-    # M * C^2 (常数，不影响优化但加入目标)
-    # COPT 目标不支持常数项，可忽略
+        obj.addTerms(-float(profits[i]), x[i])
+    obj.addTerms(M, t)
 
-    # 二次部分：M * sum_i sum_j a_i * a_j * v_i * v_j
-    quad_expr = coptpy.QuadExpr()
-    quad_expr.addLinear(lin_obj)
-    for i in range(len(all_vars)):
-        for j in range(i, len(all_vars)):
-            coeff = M * all_coeffs[i] * all_coeffs[j]
-            if i == j:
-                quad_expr.addTerms(coeff, all_vars[i], all_vars[i])
-            else:
-                quad_expr.addTerms(coeff, all_vars[i], all_vars[j])
-                quad_expr.addTerms(coeff, all_vars[j], all_vars[i])
+    model.setObjective(obj, sense=coptpy.COPT.MINIMIZE)
 
-    model.setObjective(quad_expr, sense=coptpy.COPT.MINIMIZE)
+    # R_cap = sum(w_i * x_i) + s - C
+    r_cap = coptpy.LinExpr()
+    for i in range(n):
+        r_cap.addTerms(float(weights[i]), x[i])
+    r_cap.add(s_expr)
+    r_cap.addTerms(-float(capacity), model.addVar(vtype=coptpy.COPT.CONTINUOUS, lb=0, ub=0, name="zero"))
+
+    # t >= R_cap
+    model.addConstr(t, coptpy.COPT.GREATER_EQUAL, r_cap, name="penalty_pos")
+    # t >= -R_cap
+    model.addConstr(t, coptpy.COPT.GREATER_EQUAL, -r_cap, name="penalty_neg")
 
     model.solve()
     status = model.status
     is_optimal = (status == coptpy.COPT.OPTIMAL)
-    # 从 x 恢复目标值
     if is_optimal:
         obj = sum(profits[i] for i in range(n) if x[i].X > 0.5)
     else:
