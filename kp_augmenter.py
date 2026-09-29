@@ -463,7 +463,7 @@ def run_kp_augmentation(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     theta = np.linspace(0, 2 * np.pi, 100)
-    r = max(np.max(np.abs(coords_final[:, 0])), np.max(np.abs(coords_final[:, 1])))
+    r = max(np.max(np.abs(coords[:, 0])), np.max(np.abs(coords[:, 1])))
 
     # 区分 SAGE（蓝）和 Synthetic（橙）
     origins = ["sage_original" if iid.startswith("sage_original") else "synthetic" for iid in all_features.index]
